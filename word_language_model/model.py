@@ -1,5 +1,24 @@
+import torch
 import torch.nn as nn
 from torch.autograd import Variable
+from torch.nn import functional as F
+
+@torch.jit.compile(nderivs=1)
+def LSTMCell(input, hidden, w_ih, w_hh, b_ih=None, b_hh=None):
+    hx, cx = hidden
+    gates = F.linear(input, w_ih, b_ih) + F.linear(hx, w_hh, b_hh)
+
+    ingate, forgetgate, cellgate, outgate = gates.chunk(4, 1)
+
+    ingate = F.sigmoid(ingate)
+    forgetgate = F.sigmoid(forgetgate)
+    cellgate = F.tanh(cellgate)
+    outgate = F.sigmoid(outgate)
+    cy = (forgetgate * cx) + (ingate * cellgate)
+    hy = outgate * F.tanh(cy)
+
+    return hy, cy
+
 
 class RNNModel(nn.Module):
     """Container module with an encoder, a recurrent module, and a decoder."""
@@ -8,15 +27,7 @@ class RNNModel(nn.Module):
         super(RNNModel, self).__init__()
         self.drop = nn.Dropout(dropout)
         self.encoder = nn.Embedding(ntoken, ninp)
-        if rnn_type in ['LSTM', 'GRU']:
-            self.rnn = getattr(nn, rnn_type)(ninp, nhid, nlayers, dropout=dropout)
-        else:
-            try:
-                nonlinearity = {'RNN_TANH': 'tanh', 'RNN_RELU': 'relu'}[rnn_type]
-            except KeyError:
-                raise ValueError( """An invalid option for `--model` was supplied,
-                                 options are ['LSTM', 'GRU', 'RNN_TANH' or 'RNN_RELU']""")
-            self.rnn = nn.RNN(ninp, nhid, nlayers, nonlinearity=nonlinearity, dropout=dropout)
+        self.rnn = nn.LSTM(ninp, nhid, nlayers, dropout=0)
         self.decoder = nn.Linear(nhid, ntoken)
 
         # Optionally tie weights as in:
@@ -42,17 +53,30 @@ class RNNModel(nn.Module):
         self.decoder.bias.data.fill_(0)
         self.decoder.weight.data.uniform_(-initrange, initrange)
 
+    def custom(self, input, hidden):
+        weights = self.rnn.all_weights[0]
+        output = []
+        hx, cx = hidden[0][0], hidden[1][0]
+        for i in range(input.size(0)):
+            hx, cx = LSTMCell(input[i], (hx, cx), *weights)
+            output.append(hx)
+
+        output = torch.cat(output, 0).view(input.size(0), *output[0].size())
+
+        return output, (hx.view(1, *hx.size()), cx.view(1, *cx.size()))
+
+
     def forward(self, input, hidden):
         emb = self.drop(self.encoder(input))
-        output, hidden = self.rnn(emb, hidden)
+
+        # output, hidden = self.rnn(emb, hidden)
+        output, hidden = self.custom(emb, hidden)
+
         output = self.drop(output)
         decoded = self.decoder(output.view(output.size(0)*output.size(1), output.size(2)))
         return decoded.view(output.size(0), output.size(1), decoded.size(1)), hidden
 
     def init_hidden(self, bsz):
         weight = next(self.parameters()).data
-        if self.rnn_type == 'LSTM':
-            return (Variable(weight.new(self.nlayers, bsz, self.nhid).zero_()),
-                    Variable(weight.new(self.nlayers, bsz, self.nhid).zero_()))
-        else:
-            return Variable(weight.new(self.nlayers, bsz, self.nhid).zero_())
+        return (Variable(weight.new(self.nlayers, bsz, self.nhid).zero_()),
+                Variable(weight.new(self.nlayers, bsz, self.nhid).zero_()))
